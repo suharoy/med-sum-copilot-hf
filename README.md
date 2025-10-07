@@ -1,4 +1,4 @@
-# Medical Research Summarizer — HF-only (CPU / Free)
+# Medical Research Summarizer 
 
 ## Quickstart
 ```
