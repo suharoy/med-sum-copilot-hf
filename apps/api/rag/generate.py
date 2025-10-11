@@ -1,132 +1,109 @@
-from typing import List, Dict, Tuple
+import time
+import re
+from typing import List
 from transformers import pipeline
-from sentence_transformers import SentenceTransformer
-import numpy as np
-from ..core.config import settings
 
-# ---- lazy singletons ----
-_summarizer = None
-_embedder = None
+_SUMMARIZER = None
 
-def _get_summarizer():
-    """Small, instructionless summarizer. Summarize only evidence text."""
-    global _summarizer
-    if _summarizer is None:
-        # Tip: set HF_SUMMARIZER_MODEL=t5-base in .env if BART still echoes
-        _summarizer = pipeline("summarization", model=settings.HF_SUMMARIZER_MODEL
+def get_summarizer():
+    """
+    Returns a cached summarization pipeline using a light Hugging Face model.
+    Loads only once and stays in memory.
+    """
+    global _SUMMARIZER
+    if _SUMMARIZER is None:
+        print("🔹 Loading summarizer model (DistilBART)...")
+        _SUMMARIZER = pipeline(
+            "summarization",
+            model="sshleifer/distilbart-cnn-12-6",  # faster, smaller
+            device=-1  # CPU only
         )
-    return _summarizer
+    return _SUMMARIZER
 
-def _get_embedder():
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(settings.HF_EMBED_MODEL)
-    return _embedder
 
-# ---- utilities ----
-def _split_sentences(text: str) -> List[str]:
-    parts = []
-    for para in text.split("\n"):
-        para = para.strip()
-        if not para:
-            continue
-        sents = []
-        start = 0
-        for i in range(len(para)-1):
-            if para[i] == "." and para[i+1] == " ":
-                sents.append(para[start:i+1])
-                start = i+2
-        last = para[start:].strip()
-        if last:
-            sents.append(last)
-        if not sents:
-            sents = [para]
-        parts.extend([s.strip() for s in sents if s.strip()])
-    return parts
-
-def _normalize(v: np.ndarray) -> np.ndarray:
-    n = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
-    return v / n
-
-def _extract_top_sentences(question: str, contexts: List[Dict], max_sentences: int = 6) -> List[Tuple[str, int, Dict]]:
-    """Return (sentence, evidence_idx, meta) sorted by similarity to the question."""
-    emb = _get_embedder()
-    qv = _normalize(emb.encode([question], convert_to_numpy=True))[0]
-
-    sent_texts: List[str] = []
-    sent_tags: List[Tuple[int, Dict]] = []   # (ev_idx, meta)
-
-    for i, c in enumerate(contexts, start=1):
-        sents = _split_sentences(c["text"])[:12]  # keep small
-        for s in sents:
-            sent_texts.append(s)
-            sent_tags.append((i, c["meta"]))
-
-    if not sent_texts:
-        return []
-
-    sims_all = []
-    batch = 64
-    for j in range(0, len(sent_texts), batch):
-        chunk = sent_texts[j:j+batch]
-        sv = _normalize(emb.encode(chunk, convert_to_numpy=True))
-        sims_all.append(sv @ qv)
-    sims = np.concatenate(sims_all, axis=0)
-
-    idx = np.argsort(-sims)[:max_sentences]
-    out, seen = [], set()
-    for k in idx:
-        s = sent_texts[k].strip()
-        if s in seen:
-            continue
-        seen.add(s)
-        ev_idx, meta = sent_tags[k]
-        out.append((s, ev_idx, meta))
-    return out
-
-def _extractive_bullets(picked: List[Tuple[str, int, Dict]]) -> str:
-    return "\n".join(f"• {s} [{ev}]" for (s, ev, _m) in picked)
-
-# ---- main ----
-def answer_from_context(question: str, contexts: List[Dict]) -> str:
+def chunk_text(text: str, max_words: int = 600) -> List[str]:
     """
-    1) Select top evidence sentences by similarity to the question.
-    2) Summarize ONLY those sentences (no instructions).
-    3) If anything fails, fall back to bullet points with citations.
+    Split long text into smaller chunks (for models with token limits).
     """
-    picked = _extract_top_sentences(question, contexts, max_sentences=6)
-    if not picked:
-        return "No relevant evidence found."
+    words = text.split()
+    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
 
-    # Build a compact evidence text that the model will actually summarize.
-    # We include the [#] tags inline so we can keep citations if model preserves them,
-    # but we DO NOT add any instruction words.
-    evidence_lines = [f"[{ev}] {s}" for (s, ev, _m) in picked]
-    evidence_text = " ".join(evidence_lines)
 
-    # Keep inputs well under model limits
-    words = evidence_text.split()
-    if len(words) > 900:
-        words = words[:900]
-    safe_input = " ".join(words)
+def summarize_text(text: str) -> str:
+    """
+    Performs chunked summarization and concatenates results.
+    """
+    summarizer = get_summarizer()
+    chunks = chunk_text(text)
+    summaries = []
+    for i, chunk in enumerate(chunks):
+        start = time.time()
+        try:
+            result = summarizer(
+                chunk,
+                max_length=120,
+                min_length=30,
+                do_sample=False
+            )[0]["summary_text"]
+            summaries.append(result)
+            print(f"✅ Chunk {i+1}/{len(chunks)} summarized in {time.time()-start:.2f}s")
+        except Exception as e:
+            print(f"⚠ Chunk {i+1} failed: {e}")
+    return " ".join(summaries).strip()
 
-    summarizer = _get_summarizer()
+
+def clean_summary(text: str) -> str:
+    """
+    Minor cleanup for summaries (removes references, weird spacing, etc.)
+    """
+    text = re.sub(r"\[\d+\]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def summarize_paper(context: str, question: str = None) -> str:
+    """
+    Generates a concise answer or summary based on given context and question.
+    """
+    start_time = time.time()
+    summarizer = get_summarizer()
+
+    if not context or len(context.strip()) == 0:
+        return "No context available for summarization."
+
+    # If question provided, make the summary focused
+    if question:
+        prompt = f"Summarize the following medical research text focusing on the question: '{question}'."
+    else:
+        prompt = "Summarize the following medical research text concisely and factually."
+
+    text_to_summarize = f"{prompt}\n\n{context}"
 
     try:
-        # Summarize the evidence text ONLY (no “QUESTION/ANSWER” boilerplate).
-        # For T5 models, they also work with plain text (prefix optional).
-        result = summarizer(
-            safe_input,
-            max_length=220,
-            min_length=60,
-            do_sample=False,
-            truncation=True
-        )[0]["summary_text"].strip()
+        summary = summarize_text(text_to_summarize)
+        summary = clean_summary(summary)
+        print(f"Total summarization time: {time.time() - start_time:.2f}s")
+        return summary
+    except Exception as e:
+        print(f"Summarization failed, falling back to extractive summary: {e}")
+        return extractive_summary_fallback(context)
 
-        # If the model outputs almost nothing or echoes, use extractive fallback.
-        if len(result) < 40 or "QUESTION:" in result or "CONTEXT:" in result:
-            return _extractive_bullets(picked)
-        return result
-    except Exception:
-        # Robust fallback that always works.
-        return _extractive_bullets(picked)
+
+def extractive_summary_fallback(text: str, max_sentences: int = 4) -> str:
+    """
+    Fallback summarizer: returns top few sentences as bullet points.
+    """
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    top_sentences = sentences[:max_sentences]
+    return "\n".join([f"• {s.strip()}" for s in top_sentences if len(s.strip()) > 20])
+
+
+# Example usage:
+if __name__ == "__main__":
+    example_text = """
+    Breast cancer remains a leading cause of death worldwide. Recent studies 
+    indicate the potential of immunotherapy and targeted treatments. This study 
+    evaluates meta-analytical results across several cohorts to establish the 
+    prognostic impact of the kinesin superfamily proteins in cancer progression.
+    """
+    print(summarize_paper(example_text, question="What are the new treatments for breast cancer?"))

@@ -4,7 +4,7 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 import streamlit as st, json
 from apps.api.nlp.parse_pdf import parse_pdf_to_sections
 from apps.api.rag.retrieve import SimpleStore
-from apps.api.rag.generate import answer_from_context
+from apps.api.rag.generate import summarize_paper
 from apps.api.core.config import settings
 
 st.set_page_config(page_title="Medical Research Summarizer (HF)", page_icon="🧪", layout="wide")
@@ -38,7 +38,7 @@ if st.button("Parse now"):
 
 parsed_dir = Path(settings.STORAGE_DIR) / "parsed"
 papers = sorted(parsed_dir.glob("*.json"))
-with st.expander("📚 Library", expanded=True):
+with st.expander(" Library", expanded=True):
     if not papers: st.info("No parsed papers yet.")
     else:
         for p in papers:
@@ -56,9 +56,9 @@ if st.button("Get answer", type="primary") and q:
         store = SimpleStore(parsed_dir); ctxs = store.search(q, top_k=k)
         if not ctxs: st.error("No relevant evidence found.")
         else:
-            ans = answer_from_context(q, ctxs)
-            st.markdown("### ✅ Answer"); st.write(ans)
-            with st.expander("📎 Evidence & Citations"):
+            ans = summarize_paper(q, ctxs)
+            st.markdown("###  Answer"); st.write(ans)
+            with st.expander(" Evidence & Citations"):
                 for i,c in enumerate(ctxs,1):
                     st.markdown(f"**[{i}]** `{c['meta']['source']}` — *{c['meta']['section']}*")
                     st.caption(c['text'][:600]+('...' if len(c['text'])>600 else ''))
@@ -75,7 +75,7 @@ if ids:
         j=json.loads((parsed_dir/f"{chosen}.json").read_text(encoding="utf-8"))
         ctxs=[{"text":s["text"],"meta":{"source":f"{chosen}.json","section":s["name"]}} for s in j.get("sections",[])]
         prompt=f"Summarize this paper for a {'researcher' if mode=='expert' else 'patient'}."
-        summ = answer_from_context(prompt, ctxs)
-        st.markdown("### 🧾 Summary"); st.write(summ)
+        summ = summarize_paper(prompt, ctxs)
+        st.markdown("###  Summary"); st.write(summ)
 else:
     st.info("No papers to summarize yet.")
